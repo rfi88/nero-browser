@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+import sys
+import os
+import subprocess
+import json
+import urllib.request
+from datetime import datetime
+
+# Membungkam warning Chromium & JS secara total di terminal Fedora
+os.environ["QT_LOGGING_RULES"] = "qt.webenginecontext.debug=false;*.warning=false;qt.webenginepage.debug=false"
+
+from PyQt6.QtCore import QUrl, Qt, QTimer, QThread, pyqtSignal
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QLineEdit, QPushButton, QTabBar,
+                             QStackedWidget, QProgressBar, QDialog, QLabel,
+                             QScrollArea, QMenu, QListWidget, QListWidgetItem, QMessageBox)
+from PyQt6.QtGui import QAction
+from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineScript, QWebEngineSettings
+from PyQt6.QtWebEngineWidgets import QWebEngineView
+
+# File Penyimpanan Data
+BOOKMARKS_FILE = os.path.expanduser("~/.nero_bookmarks.json")
+HISTORY_FILE = os.path.expanduser("~/.nero_history.json")
+
+STYLE_SHEET = """
+QMainWindow, QDialog { background-color: #1c1b22; color: #fbfbfe; }
+QWidget#nav-bar { background-color: #2b2a33; padding: 6px; border-bottom: 1px solid #3c3b43; }
+QLineEdit#url-bar { background-color: #1c1b22; color: #fbfbfe; border: 1px solid #5b5b66; border-radius: 8px; padding: 6px 12px; font-size: 14px; }
+QLineEdit#url-bar:focus { border: 1px solid #00ddff; background-color: #2b2a33; }
+QPushButton { background-color: transparent; color: #fbfbfe; border: none; border-radius: 4px; padding: 6px; min-width: 28px; }
+QPushButton:hover { background-color: #52525e; }
+QPushButton#btn-action { background-color: #00ddff; color: #1c1b22; font-weight: bold; border-radius: 4px; padding: 4px 8px; }
+QPushButton#btn-action:hover { background-color: #00b4d8; }
+QTabBar::tab { background-color: #1c1b22; color: #94949e; padding: 8px 16px; border-top-left-radius: 8px; border-top-right-radius: 8px; margin-right: 2px; min-width: 100px; max-width: 150px; }
+QTabBar::tab:selected { background-color: #2b2a33; color: #fbfbfe; font-weight: bold; }
+QProgressBar { background-color: #2b2a33; border: 1px solid #3c3b43; border-radius: 4px; text-align: center; color: #ffffff; height: 18px; }
+QProgressBar::chunk { background-color: #00ddff; }
+QMenu { background-color: #2b2a33; color: #fbfbfe; border: 1px solid #3c3b43; border-radius: 6px; padding: 5px; }
+QMenu::item { padding: 8px 24px; border-radius: 4px; }
+QMenu::item:selected { background-color: #52525e; color: #00ddff; }
+QListWidget { background-color: #2b2a33; color: #fbfbfe; border: 1px solid #3c3b43; border-radius: 8px; padding: 5px; }
+QListWidget::item { padding: 8px; border-bottom: 1px solid #3c3b43; }
+QListWidget::item:hover { background-color: #52525e; border-radius: 4px; }
+"""
+
+class YouTubeExtractorThread(QThread):
+    extraction_done = pyqtSignal(str, str, str)
+
+    def __init__(self, youtube_url):
+        super().__init__()
+        self.youtube_url = youtube_url
+
+    def run(self):
+        try:
+            # SAKTI: Ditambahkan --no-playlist agar tidak nyangkut saat buka YouTube Mix / Playlist!
+            cmd_title = ["yt-dlp", "--no-playlist", "--js-runtimes", "node", "--get-title", self.youtube_url]
+            proc_title = subprocess.Popen(cmd_title, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout_title, _ = proc_title.communicate(timeout=15)
+            title = stdout_title.strip() if proc_title.returncode == 0 else "YouTube_Video"
+
+            clean_title = "".join([c for c in title if c.isalpha() or c.isdigit() or c in " .-_()"]).strip()
+            file_name = f"{clean_title}.mp4"
+
+            # SAKTI: Ditambahkan --no-playlist juga di pencarian link
+            cmd_url = ["yt-dlp", "--no-playlist", "--js-runtimes", "node", "-g", "-f", "b[ext=mp4]/b", self.youtube_url]
+            proc_url = subprocess.Popen(cmd_url, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout_url, _ = proc_url.communicate(timeout=15)
+            stream_url = stdout_url.strip()
+
+            if proc_url.returncode == 0 and stream_url:
+                if "m3u8" in stream_url or "manifest" in stream_url:
+                    self.extraction_done.emit("use_ytdlp_direct", self.youtube_url, file_name)
+                else:
+                    self.extraction_done.emit("success", stream_url, file_name)
+                return
+            self.extraction_done.emit("failed", "", "")
+        except subprocess.TimeoutExpired:
+            # Jika memakan waktu terlalu lama (>15 detik), gagalkan agar tidak stuck di jam pasir
+            self.extraction_done.emit("error", "Waktu ekstraksi habis (Timeout)", "")
+        except Exception as e:
+            self.extraction_done.emit("error", str(e), "")
+
+class DataManagerDialog(QDialog):
+    def __init__(self, title, file_path, callback_open_url, parent=None, is_history=False):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(600, 450)
+        self.setStyleSheet(STYLE_SHEET)
+        self.file_path = file_path
+        self.callback_open_url = callback_open_url
+        self.is_history = is_history
+        self.layout = QVBoxLayout(self)
+
+        header_layout = QHBoxLayout()
+        self.label_title = QLabel(f"<b>Daftar {title}</b>")
+        header_layout.addWidget(self.label_title)
+
+        if self.is_history:
+            self.btn_clear = QPushButton("🗑️ Bersihkan Riwayat")
+            self.btn_clear.setStyleSheet("background-color: #e53935; color: white; font-weight: bold; padding: 4px 10px; border-radius: 4px;")
+            self.btn_clear.clicked.connect(self.clear_all_data)
+            header_layout.addWidget(self.btn_clear)
+
+        self.layout.addLayout(header_layout)
+        self.list_widget = QListWidget()
+        self.list_widget.itemDoubleClicked.connect(self.handle_item_clicked)
+        self.layout.addWidget(self.list_widget)
+        self.load_data()
+
+    def load_data(self):
+        self.list_widget.clear()
+        if not os.path.exists(self.file_path): return
+        try:
+            with open(self.file_path, "r") as f:
+                data_list = json.load(f)
+            for item in reversed(data_list):
+                display_text = f"[{item.get('time', '')}] {item.get('title', 'No Title')} \n🔗 {item.get('url', '')}" if self.is_history else f"⭐ {item.get('title', 'No Title')} \n🔗 {item.get('url', '')}"
+                list_item = QListWidgetItem(display_text)
+                list_item.setData(Qt.ItemDataRole.UserRole, item.get('url'))
+                self.list_widget.addItem(list_item)
+        except: pass
+
+    def handle_item_clicked(self, item):
+        url = item.data(Qt.ItemDataRole.UserRole)
+        if url:
+            self.callback_open_url(url)
+            self.accept()
+
+    def clear_all_data(self):
+        try:
+            with open(self.file_path, "w") as f: json.dump([], f)
+            self.load_data()
+        except: pass
+
+class DownloadManagerDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Nero Download Manager")
+        self.resize(550, 400)
+        self.setStyleSheet(STYLE_SHEET)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowStaysOnTopHint)
+        self.layout = QVBoxLayout(self)
+
+        self.label_title = QLabel("<b>Daftar Unduhan (Aria2c Engine)</b>")
+        self.layout.addWidget(self.label_title)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll_content = QWidget()
+        self.scroll_layout = QVBoxLayout(self.scroll_content)
+        self.scroll_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.scroll.setWidget(self.scroll_content)
+        self.layout.addWidget(self.scroll)
+
+        self.download_widgets = {}
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.update_all_progress)
+        self.timer.start(1000)
+
+    def add_download(self, gid, file_name):
+        item_widget = QWidget()
+        item_layout = QVBoxLayout(item_widget)
+        lbl_name = QLabel(f"📄 {file_name}")
+        lbl_name.setWordWrap(True)
+        prog_bar = QProgressBar()
+        prog_bar.setRange(0, 100)
+        lbl_status = QLabel("Menghubungkan ke Server Aria2c...")
+
+        btn_layout = QHBoxLayout()
+        btn_pause = QPushButton("⏸ Pause")
+        btn_resume = QPushButton("▶ Resume")
+        btn_delete = QPushButton("🗑️ Hapus")
+        btn_pause.setObjectName("btn-action")
+        btn_resume.setObjectName("btn-action")
+        btn_delete.setStyleSheet("background-color: #e53935; color: white; font-weight: bold; border-radius:4px; padding: 4px 10px;")
+
+        btn_pause.clicked.connect(lambda: self.aria2_rpc("aria2.pause", gid))
+        btn_resume.clicked.connect(lambda: self.aria2_rpc("aria2.unpause", gid))
+        btn_delete.clicked.connect(lambda: self.remove_specific_download(gid))
+
+        btn_layout.addWidget(btn_pause)
+        btn_layout.addWidget(btn_resume)
+        btn_layout.addWidget(btn_delete)
+        btn_layout.addStretch()
+
+        item_layout.addWidget(lbl_name)
+        item_layout.addWidget(prog_bar)
+        item_layout.addWidget(lbl_status)
+        item_layout.addLayout(btn_layout)
+
+        line = QWidget()
+        line.setStyleSheet("background-color: #3c3b43; max-height: 1px;")
+        item_layout.addWidget(line)
+        self.scroll_layout.addWidget(item_widget)
+
+        self.download_widgets[gid] = {"bar": prog_bar, "status": lbl_status, "widget": item_widget, "is_finished": False}
+
+    def aria2_rpc(self, method, gid):
+        try:
+            req_data = json.dumps({"jsonrpc": "2.0", "id": "nero", "method": method, "params": [gid]}).encode()
+            req = urllib.request.Request("http://localhost:6800/jsonrpc", data=req_data, headers={'Content-Type': 'application/json'})
+            urllib.request.urlopen(req, timeout=1)
+        except: pass
+
+    def update_all_progress(self):
+        try:
+            req_data = json.dumps({"jsonrpc": "2.0", "id": "nero", "method": "aria2.tellActive", "params": []}).encode()
+            req = urllib.request.Request("http://localhost:6800/jsonrpc", data=req_data, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=1) as response:
+                active_downloads = json.loads(response.read().decode())['result']
+            for dl in active_downloads:
+                gid = dl['gid']
+                if gid in self.download_widgets:
+                    completed = int(dl['completedLength'])
+                    total = int(dl['totalLength'])
+                    speed = int(dl['downloadSpeed']) / 1024 / 1024
+                    percent = int((completed / total) * 100) if total > 0 else 0
+                    self.download_widgets[gid]["bar"].setValue(percent)
+                    self.download_widgets[gid]["status"].setText(f"Status: Mendownload... | Kecepatan: {speed:.2f} MB/s")
+                    self.download_widgets[gid]["status"].setStyleSheet("color: #ffffff;")
+                    self.download_widgets[gid]["is_finished"] = False
+        except: pass
+
+        try:
+            req_data_waiting = json.dumps({"jsonrpc": "2.0", "id": "nero", "method": "aria2.tellWaiting", "params": [0, 50]}).encode()
+            req_waiting = urllib.request.Request("http://localhost:6800/jsonrpc", data=req_data_waiting, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req_waiting, timeout=1) as response_waiting:
+                waiting_downloads = json.loads(response_waiting.read().decode())['result']
+            for dl in waiting_downloads:
+                gid = dl['gid']
+                if gid in self.download_widgets and dl['status'] == 'paused':
+                    self.download_widgets[gid]["status"].setText("Status: ⏸ Di-Pause")
+                    self.download_widgets[gid]["status"].setStyleSheet("color: #ffaa00;")
+        except: pass
+
+        try:
+            req_data_stopped = json.dumps({"jsonrpc": "2.0", "id": "nero", "method": "aria2.tellStopped", "params": [0, 50]}).encode()
+            req_stopped = urllib.request.Request("http://localhost:6800/jsonrpc", data=req_data_stopped, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req_stopped, timeout=1) as response_stopped:
+                stopped_downloads = json.loads(response_stopped.read().decode())['result']
+            for dl in stopped_downloads:
+                gid = dl['gid']
+                if gid in self.download_widgets:
+                    self.download_widgets[gid]["is_finished"] = True
+                    if dl['status'] == 'complete':
+                        self.download_widgets[gid]["bar"].setValue(100)
+                        self.download_widgets[gid]["status"].setText("Status: ✨ Selesai Berhasil")
+                        self.download_widgets[gid]["status"].setStyleSheet("color: #00ddff;")
+                    elif dl['status'] == 'removed':
+                        self.download_widgets[gid]["status"].setText("Status: ✖ Dihapus")
+                        self.download_widgets[gid]["status"].setStyleSheet("color: #ff3333;")
+                    elif dl['status'] == 'error':
+                        self.download_widgets[gid]["status"].setText("Status: ⚠️ Gagal/Eror!")
+                        self.download_widgets[gid]["status"].setStyleSheet("color: #ffaa00;")
+        except: pass
+
+    def remove_specific_download(self, gid):
+        if gid in self.download_widgets:
+            info = self.download_widgets[gid]
+            try:
+                self.aria2_rpc("aria2.forceRemove", gid)
+                self.aria2_rpc("aria2.purgeDownloadResult", gid)
+            except: pass
+            if info["widget"]:
+                self.scroll_layout.removeWidget(info["widget"])
+                info["widget"].setParent(None)
+                info["widget"].deleteLater()
+            del self.download_widgets[gid]
+
+class NeroWebPage(QWebEnginePage):
+    def acceptNavigationRequest(self, url, _type, isMainFrame):
+        url_str = url.toString()
+        ad_domains = ["doubleclick.net", "googleads", "adservice", "popads", "adnxs", "pagead2", "googlesyndication"]
+        if any(domain in url_str for domain in ad_domains):
+            return False
+        return True
+
+class NeroBrowser(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Nero Web Browser (Engine Express)")
+        self.resize(1280, 800)
+        self.setStyleSheet(STYLE_SHEET)
+
+        subprocess.Popen(["aria2c", "--enable-rpc", "--rpc-listen-all=false", "-x", "16", "-s", "16"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        self.dl_manager = DownloadManagerDialog(self)
+        self.custom_profile = QWebEngineProfile("NeroProfile", self)
+        self.custom_profile.downloadRequested.connect(self.handle_aria2_download)
+
+        self.inject_adblocker()
+
+        self.main_widget = QWidget()
+        self.setCentralWidget(self.main_widget)
+        self.layout = QVBoxLayout(self.main_widget)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.layout.setSpacing(0)
+
+        self.tab_bar = QTabBar()
+        self.tab_bar.setExpanding(False)
+        self.tab_bar.setTabsClosable(True)
+        self.tab_bar.setMovable(True)
+        self.tab_bar.tabBarClicked.connect(self.switch_tab)
+        self.tab_bar.tabCloseRequested.connect(self.close_tab)
+        self.layout.addWidget(self.tab_bar)
+
+        self.nav_bar = QWidget()
+        self.nav_bar.setObjectName("nav-bar")
+        self.nav_layout = QHBoxLayout(self.nav_bar)
+        self.nav_layout.setContentsMargins(8, 4, 8, 4)
+
+        self.btn_back = QPushButton("◀")
+        self.btn_forward = QPushButton("▶")
+        self.btn_reload = QPushButton("⟳")
+        self.btn_spinner = QPushButton("✖")
+        self.btn_back.clicked.connect(self.current_browser_action('back'))
+        self.btn_forward.clicked.connect(self.current_browser_action('forward'))
+        self.btn_reload.clicked.connect(self.current_browser_action('reload'))
+
+        self.nav_layout.addWidget(self.btn_back)
+        self.nav_layout.addWidget(self.btn_forward)
+        self.nav_layout.addWidget(self.btn_reload)
+        self.nav_layout.addWidget(self.btn_spinner)
+
+        self.url_bar = QLineEdit()
+        self.url_bar.setObjectName("url-bar")
+        self.url_bar.setPlaceholderText("Ketik URL atau cari sesuatu...")
+        self.url_bar.returnPressed.connect(self.navigate_to_url)
+        self.nav_layout.addWidget(self.url_bar)
+
+        self.btn_bookmark = QPushButton("⭐")
+        self.btn_bookmark.setToolTip("Tambahkan ke Bookmark")
+        self.btn_bookmark.clicked.connect(self.add_current_to_bookmarks)
+        self.nav_layout.addWidget(self.btn_bookmark)
+
+        self.btn_yt_download = QPushButton("📥")
+        self.btn_yt_download.setToolTip("Download Video YouTube")
+        self.btn_yt_download.setStyleSheet("color: #ff3333; font-weight: bold;")
+        self.btn_yt_download.setEnabled(False)
+        self.btn_yt_download.clicked.connect(self.download_youtube_video)
+        self.nav_layout.addWidget(self.btn_yt_download)
+
+        self.btn_new_tab = QPushButton("➕")
+        self.btn_new_tab.clicked.connect(lambda: self.add_tab("https://google.com"))
+        self.nav_layout.addWidget(self.btn_new_tab)
+
+        self.btn_menu = QPushButton("☰")
+        self.btn_menu.setStyleSheet("font-size: 16px; font-weight: bold;")
+        self.btn_menu.clicked.connect(self.show_hamburger_menu)
+        self.nav_layout.addWidget(self.btn_menu)
+        self.layout.addWidget(self.nav_bar)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(3)
+        self.layout.addWidget(self.progress_bar)
+
+        self.container = QStackedWidget()
+        self.layout.addWidget(self.container)
+
+        self.browsers = []
+        self.add_tab("https://google.com")
+
+    def inject_adblocker(self):
+        adblock_js = """
+        (function() {
+            if (window.location.href === "about:blank") return;
+            const blockSelectors = [
+                '.video-ads', '.ytp-ad-module', '.ytp-ad-overlay-container',
+                '#player-ads', '#masthead-ad', 'ytd-ad-slot-renderer',
+                'iframe[src*="googleads"]', 'div[id^="div-gpt-ad"]', '.ad-box'
+            ];
+            function removeAds() {
+                blockSelectors.forEach(selector => {
+                    document.querySelectorAll(selector).forEach(el => el.remove());
+                });
+                let skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern');
+                if (skipBtn) { skipBtn.click(); }
+                let video = document.querySelector('video');
+                let adShowing = document.querySelector('.ad-showing, .ad-interrupting');
+                if (video && adShowing) { video.currentTime = video.duration || 0; }
+            }
+            setInterval(removeAds, 500);
+        })();
+        """
+        script = QWebEngineScript()
+        script.setSourceCode(adblock_js)
+        script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+        script.setWorldId(QWebEngineScript.ScriptWorldId.MainWorld)
+        script.setRunsOnSubFrames(True)
+        self.custom_profile.scripts().insert(script)
+
+    def show_hamburger_menu(self):
+        menu = QMenu(self)
+        action_download = QAction("📥 Download Manager", self)
+        action_download.triggered.connect(self.show_download_manager)
+        action_bookmarks = QAction("⭐ Bookmarks Favorit", self)
+        action_bookmarks.triggered.connect(self.show_bookmarks_manager)
+        action_history = QAction("📜 Riwayat Jelajah", self)
+        action_history.triggered.connect(self.show_history_manager)
+        action_new_tab = QAction("➕ New Tab", self)
+        action_new_tab.triggered.connect(lambda: self.add_tab("https://google.com"))
+        action_exit = QAction("✖ Exit Browser", self)
+        action_exit.triggered.connect(self.close)
+
+        menu.addAction(action_bookmarks)
+        menu.addAction(action_history)
+        menu.addAction(action_download)
+        menu.addAction(action_new_tab)
+        menu.addSeparator()
+        menu.addAction(action_exit)
+        menu.exec(self.btn_menu.mapToGlobal(self.btn_menu.rect().bottomLeft()))
+
+    def show_download_manager(self):
+        self.dl_manager.hide()
+        self.dl_manager.show()
+        self.dl_manager.raise_()
+        self.dl_manager.activateWindow()
+
+    def show_bookmarks_manager(self):
+        dialog = DataManagerDialog("Bookmarks", BOOKMARKS_FILE, self.open_url_in_current_tab, self)
+        dialog.exec()
+
+    def show_history_manager(self):
+        dialog = DataManagerDialog("Riwayat Penjelajahan", HISTORY_FILE, self.open_url_in_current_tab, self, is_history=True)
+        dialog.exec()
+
+    def open_url_in_current_tab(self, url_str):
+        if self.container.currentWidget():
+            self.container.currentWidget().load(QUrl(url_str))
+
+    def add_current_to_bookmarks(self):
+        view = self.container.currentWidget()
+        if not view: return
+        url = view.url().toString()
+        title = view.title() or url
+        bookmarks = []
+        if os.path.exists(BOOKMARKS_FILE):
+            try:
+                with open(BOOKMARKS_FILE, "r") as f: bookmarks = json.load(f)
+            except: pass
+        if not any(b.get('url') == url for b in bookmarks):
+            bookmarks.append({"title": title, "url": url})
+            try:
+                with open(BOOKMARKS_FILE, "w") as f: json.dump(bookmarks, f, indent=4)
+            except: pass
+
+    def log_to_history(self, title, url_str):
+        if not url_str or url_str == "about:blank" or "google.com/search" in url_str: return
+        history = []
+        if os.path.exists(HISTORY_FILE):
+            try:
+                with open(HISTORY_FILE, "r") as f: history = json.load(f)
+            except: pass
+        now_str = datetime.now().strftime("%H:%M:%S")
+        history.append({"title": title or url_str, "url": url_str, "time": now_str})
+        if len(history) > 500: history.pop(0)
+        try:
+            with open(HISTORY_FILE, "w") as f: json.dump(history, f, indent=4)
+        except: pass
+
+    def download_youtube_video(self):
+        view = self.container.currentWidget()
+        if not view: return
+        url_str = view.url().toString()
+        if "youtube.com/watch" not in url_str: return
+        self.btn_yt_download.setEnabled(False)
+        self.btn_yt_download.setText("⏳")
+        self.extractor_thread = YouTubeExtractorThread(url_str)
+        self.extractor_thread.extraction_done.connect(self.handle_youtube_extraction_result)
+        self.extractor_thread.start()
+
+    def handle_youtube_extraction_result(self, status, stream_url_or_source, file_name):
+        self.btn_yt_download.setEnabled(True)
+        self.btn_yt_download.setText("📥")
+        download_dir = os.path.expanduser("~/Downloads")
+        output_path = os.path.join(download_dir, file_name)
+
+        if status == "success":
+            try:
+                req_data = json.dumps({
+                    "jsonrpc": "2.0", "id": "nero", "method": "aria2.addUri",
+                    "params": [[stream_url_or_source], {"dir": download_dir, "out": file_name}]
+                }).encode()
+                req = urllib.request.Request("http://localhost:6800/jsonrpc", data=req_data, headers={'Content-Type': 'application/json'})
+                with urllib.request.urlopen(req, timeout=1) as response:
+                    gid = json.loads(response.read().decode())['result']
+                self.show_download_manager()
+                self.dl_manager.add_download(gid, file_name)
+            except Exception as e: print(f"Aria2c Error: {e}")
+        elif status == "use_ytdlp_direct":
+            subprocess.Popen(["yt-dlp", "--no-playlist", "--js-runtimes", "node", "-f", "b", "-o", output_path, stream_url_or_source], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            QMessageBox.information(self, "Mendownload Live/HLS Stream", f"Video siaran langsung sedang diunduh langsung lewat mesin yt-dlp.\n\nFile disimpan ke: Downloads/{file_name}")
+        elif status == "error":
+            QMessageBox.warning(self, "Download Error", f"Gagal memproses link:\n{stream_url_or_source}")
+        else:
+            QMessageBox.warning(self, "Download Gagal", "Gagal mengekstrak video. Pastikan video tersedia/tidak diblokir.")
+
+    def add_tab(self, url_str):
+        view = QWebEngineView()
+        page = NeroWebPage(self.custom_profile, view)
+        view.setPage(page)
+        page.settings().setAttribute(QWebEngineSettings.WebAttribute.FullScreenSupportEnabled, True)
+
+        view.urlChanged.connect(lambda qurl, v=view: self.update_url_bar(qurl, v))
+        view.loadProgress.connect(self.handle_load_progress)
+        view.titleChanged.connect(lambda title, v=view: self.handle_title_changed(title, v))
+        page.fullScreenRequested.connect(self.handle_fullscreen_request)
+
+        self.browsers.append(view)
+        self.container.addWidget(view)
+        self.tab_bar.addTab("Loading...")
+        self.tab_bar.setCurrentIndex(self.tab_bar.count() - 1)
+        self.container.setCurrentWidget(view)
+        view.load(QUrl(url_str))
+
+    def handle_title_changed(self, title, view):
+        self.update_tab_title(title, view)
+        if title and title != "Loading...": self.log_to_history(title, view.url().toString())
+
+    def handle_fullscreen_request(self, request):
+        request.accept()
+        if request.toggleOn():
+            self.nav_bar.hide()
+            self.tab_bar.hide()
+            self.showFullScreen()
+        else:
+            self.nav_bar.show()
+            self.tab_bar.show()
+            self.showNormal()
+
+    def switch_tab(self, index):
+        if index >= 0:
+            view = self.browsers[index]
+            self.container.setCurrentWidget(view)
+            self.url_bar.setText(view.url().toString())
+            url_str = view.url().toString()
+            self.btn_yt_download.setEnabled("youtube.com/watch" in url_str)
+
+    def close_tab(self, index):
+        if self.tab_bar.count() > 1:
+            self.tab_bar.removeTab(index)
+            view = self.browsers.pop(index)
+            self.container.removeWidget(view)
+            view.deleteLater()
+
+    def current_browser_action(self, action):
+        return lambda: getattr(self.container.currentWidget(), action)() if self.container.currentWidget() else None
+
+    def navigate_to_url(self):
+        q = self.url_bar.text()
+        if not q.startswith("http://") and not q.startswith("https://"):
+            if "." in q and " " not in q: q = "https://" + q
+            else: q = f"https://www.google.com/search?q={q}"
+        self.container.currentWidget().load(QUrl(q))
+
+    def update_url_bar(self, qurl, view):
+        if view == self.container.currentWidget():
+            url_str = qurl.toString()
+            self.url_bar.setText(url_str)
+            self.btn_yt_download.setEnabled("youtube.com/watch" in url_str)
+
+    def update_tab_title(self, title, view):
+        if view in self.browsers:
+            index = self.browsers.index(view)
+            short_title = title[:12] + "..." if len(title) > 12 else title
+            self.tab_bar.setTabText(index, short_title)
+
+    def handle_load_progress(self, progress):
+        self.progress_bar.setValue(progress)
+        if progress < 100:
+            self.progress_bar.show()
+            self.btn_spinner.setText("⟳")
+            self.btn_spinner.setStyleSheet("color: #00ddff; font-weight: bold;")
+        else:
+            self.progress_bar.hide()
+            self.btn_spinner.setText("✖")
+            self.btn_spinner.setStyleSheet("color: #94949e;")
+
+    def handle_aria2_download(self, download_item):
+        file_url = download_item.url().toString()
+        suggested_name = download_item.suggestFileName() if hasattr(download_item, 'suggestFileName') else download_item.suggestedFileName()
+        download_item.cancel()
+        download_dir = os.path.expanduser("~/Downloads")
+        try:
+            req_data = json.dumps({
+                "jsonrpc": "2.0", "id": "nero",
+                "method": "aria2.addUri", "params": [[file_url], {"dir": download_dir, "out": suggested_name}]
+            }).encode()
+            req = urllib.request.Request("http://localhost:6800/jsonrpc", data=req_data, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=1) as response:
+                gid = json.loads(response.read().decode())['result']
+            self.show_download_manager()
+            self.dl_manager.add_download(gid, suggested_name)
+        except Exception as e: print(f"Internal Download Error: {e}")
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    browser = NeroBrowser()
+    browser.show()
+    sys.exit(app.exec())
